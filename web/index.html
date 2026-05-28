@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebRTC Video Call</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; max-width: 900px; }
+    .videos { display: flex; flex-wrap: wrap; gap: 8px; }
+    video {
+      width: min(100%, 420px);
+      aspect-ratio: 4/3;
+      background: #111;
+      border: 2px solid #333;
+      object-fit: cover;
+    }
+    #status { margin: 12px 0; padding: 10px; border-radius: 6px; background: #f4f4f4; }
+    #status.error { background: #fde8e8; color: #8a1f1f; }
+    button { margin: 4px 8px 4px 0; padding: 10px 16px; font-size: 16px; }
+    button:disabled { opacity: 0.5; }
+  </style>
+</head>
+<body>
+  <h1>WebRTC Video Call</h1>
+  <p id="status">Нажмите «Включить камеру» на обоих устройствах, затем «Позвонить» на одном из них.</p>
+  <div class="videos">
+    <video id="local" autoplay muted playsinline></video>
+    <video id="remote" autoplay muted playsinline></video>
+  </div>
+  <div>
+    <button id="startBtn">Включить камеру</button>
+    <button id="callBtn" disabled>Позвонить</button>
+  </div>
+
+  <script>
+    const localVideo = document.getElementById('local');
+    const remoteVideo = document.getElementById('remote');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const callBtn = document.getElementById('callBtn');
+    let pc, localStream, ws;
+    const pendingCandidates = [];
+    const pcConfig = { iceServers: [] };
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle('error', !!isError);
+    }
+
+    function wsURL() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${proto}://${location.host}/ws`;
+    }
+
+    function connectSignaling() {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      ws = new WebSocket(wsURL());
+      ws.onopen = () => setStatus('Сигналинг подключён. Включите камеру на обоих устройствах.');
+      ws.onclose = () => setStatus('Соединение с сервером разорвано. Обновите страницу.', true);
+      ws.onerror = () => setStatus('Ошибка WebSocket. Проверьте, что сервер запущен.', true);
+      ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+    }
+
+    async function startCamera() {
+      if (!window.isSecureContext) {
+        setStatus(
+          'На iPhone камера работает только по HTTPS (или localhost). ' +
+          'Запустите сервер с -tls и откройте https://IP-адрес:8443',
+          true
+        );
+        return;
+      }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setStatus('Браузер не поддерживает доступ к камере.', true);
+        return;
+      }
+      startBtn.disabled = true;
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localVideo.srcObject = localStream;
+        await localVideo.play();
+        callBtn.disabled = false;
+        setStatus('Камера включена. На втором устройстве тоже нажмите «Включить камеру», затем «Позвонить» здесь.');
+      } catch (err) {
+        startBtn.disabled = false;
+        setStatus('Не удалось включить камеру: ' + (err.message || err), true);
+      }
+    }
+
+    function createPeerConnection() {
+      if (pc) return;
+      if (!localStream) {
+        setStatus('Сначала включите камеру.', true);
+        return;
+      }
+      pc = new RTCPeerConnection(pcConfig);
+      localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+      pc.ontrack = async (e) => {
+        remoteVideo.srcObject = e.streams[0];
+        try {
+          await remoteVideo.play();
+        } catch (_) { /* autoplay blocked — tap page if needed */ }
+        setStatus('Удалённое видео подключено.');
+      };
+      pc.onicecandidate = (e) => {
+        if (e.candidate && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') {
+          setStatus('WebRTC не соединился. Оба устройства в одной сети? Попробуйте снова.', true);
+        }
+      };
+    }
+
+    async function flushCandidates() {
+      while (pendingCandidates.length && pc?.remoteDescription) {
+        const c = pendingCandidates.shift();
+        await pc.addIceCandidate(new RTCIceCandidate(c));
+      }
+    }
+
+    async function createOffer() {
+      if (!localStream) {
+        setStatus('Сначала включите камеру.', true);
+        return;
+      }
+      createPeerConnection();
+      if (!pc) return;
+      callBtn.disabled = true;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
+      setStatus('Звонок… ждём ответ второго устройства.');
+    }
+
+    async function handleMessage(msg) {
+      if (!localStream) {
+        setStatus('На этом устройстве ещё не включена камера — нажмите «Включить камеру».', true);
+        return;
+      }
+      if (!pc) createPeerConnection();
+      if (!pc) return;
+
+      if (msg.type === 'offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        await flushCandidates();
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
+        setStatus('Входящий звонок принят.');
+      } else if (msg.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        await flushCandidates();
+        callBtn.disabled = false;
+        setStatus('Соединение установлено.');
+      } else if (msg.type === 'candidate') {
+        if (pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } else {
+          pendingCandidates.push(msg.candidate);
+        }
+      }
+    }
+
+    if (!window.isSecureContext) {
+      setStatus(
+        'Открыто по HTTP — на iPhone камера не заработает. ' +
+        'Запустите: go run ./cmd -tls и откройте https://<IP>:8443 (не http и не порт 8080 для HTTPS)',
+        true
+      );
+    }
+
+    connectSignaling();
+    startBtn.onclick = () => startCamera();
+    callBtn.onclick = () => createOffer();
+  </script>
+</body>
+</html>
