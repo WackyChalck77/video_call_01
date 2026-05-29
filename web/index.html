@@ -80,7 +80,7 @@
 </head>
 <body>
   <h1>ПО для тестирования видео звонка по WebRTC 🎦</h1>
-  <p id="status">Нажмите «Включить камеру» на обоих устройствах, затем «Позвонить» на одном из них.</p>
+  <p id="status">Нажмите «Подключить устройства» на обоих компьютерах (достаточно камеры или микрофона — можно и без них), затем «Позвонить» на одном из них.</p>
   <p id="mediaInfo"></p>
   <div class="mic-meter" id="micMeter" hidden>
     <span>Микрофон:</span>
@@ -100,10 +100,11 @@
     </div>
   </div>
   <div>
-    <button id="startBtn">Включить камеру</button>
+    <button id="startBtn">Подключить устройства</button>
     <button id="callBtn" disabled>Позвонить</button>
     <button id="hangupBtn" class="danger" disabled>Завершить звонок</button>
     <button id="muteMicBtn" disabled>Выключить микрофон</button>
+    <button id="muteCamBtn" disabled>Выключить камеру</button>
     <button id="unmuteRemoteBtn" disabled hidden>Включить звук собеседника</button>
   </div>
 
@@ -125,13 +126,14 @@
     const callBtn = document.getElementById('callBtn');
     const hangupBtn = document.getElementById('hangupBtn');
     const muteMicBtn = document.getElementById('muteMicBtn');
+    const muteCamBtn = document.getElementById('muteCamBtn');
     const unmuteRemoteBtn = document.getElementById('unmuteRemoteBtn');
     const statsPanel = document.getElementById('statsPanel');
     const statsBody = document.getElementById('statsBody');
     const localIpEl = document.getElementById('localIp');
     const remoteIpEl = document.getElementById('remoteIp');
 
-    let pc, localStream, ws, inCall = false, micMuted = false;
+    let pc, localStream, ws, inCall = false, micMuted = false, camMuted = false, mediaReady = false;
     let mySignalingIp = '';
     let peerSignalingIp = '';
     let peerWebRTCIp = '';
@@ -412,7 +414,7 @@
       const v = localStream.getVideoTracks()[0];
       const a = localStream.getAudioTracks()[0];
       const parts = [];
-      parts.push(v ? 'камера: ' + (v.label || 'вкл') : 'камера: нет');
+      parts.push(v ? 'камера: ' + (v.label || 'вкл') + (v.enabled ? '' : ' (выкл)') : 'камера: нет');
       parts.push(a ? 'микрофон: ' + (a.label || 'вкл') + (a.enabled ? '' : ' (выкл)') : 'микрофон: нет');
       mediaInfoEl.textContent = parts.join(' · ');
     }
@@ -426,7 +428,7 @@
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       ws = new WebSocket(wsURL());
       ws.onopen = () => {
-        setStatus('Включите камеру на обоих устройствах.');
+        setStatus('Подключите устройства на обоих компьютерах (камера и/или микрофон не обязательны).');
         fetchMyIp();
       };
       ws.onclose = () => setStatus('Соединение с сервером разорвано. Обновите страницу.', true);
@@ -486,9 +488,10 @@
 
     function setInCall(active) {
       inCall = active;
-      callBtn.disabled = active || !localStream;
+      callBtn.disabled = active || !mediaReady;
       hangupBtn.disabled = !active;
-      muteMicBtn.disabled = !localStream;
+      muteMicBtn.disabled = !localStream?.getAudioTracks().length;
+      muteCamBtn.disabled = !localStream?.getVideoTracks().length;
     }
 
     function sendSignal(payload) {
@@ -519,39 +522,95 @@
       setStatus('Звонок завершён. Можно снова нажать «Позвонить».');
     }
 
+    async function acquireLocalMedia() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        return new MediaStream();
+      }
+      const attempts = [
+        mediaConstraints,
+        { video: mediaConstraints.video, audio: false },
+        { audio: mediaConstraints.audio, video: false },
+        { video: true, audio: false },
+        { audio: true, video: false },
+      ];
+      for (const constraints of attempts) {
+        try {
+          return await navigator.mediaDevices.getUserMedia(constraints);
+        } catch (_) { /* пробуем следующий вариант */ }
+      }
+      return new MediaStream();
+    }
+
+    function describeMediaState() {
+      const v = localStream?.getVideoTracks().length;
+      const a = localStream?.getAudioTracks().length;
+      if (v && a) {
+        return 'Камера и микрофон подключены. Проверьте уровень микрофона. На втором устройстве нажмите «Подключить устройства».';
+      }
+      if (v) {
+        return 'Камера подключена, микрофон недоступен — звонок возможен, вы не передаёте звук.';
+      }
+      if (a) {
+        return 'Микрофон подключен, камера недоступна — звонок возможен, собеседник не увидит ваше видео.';
+      }
+      return 'Камера и микрофон недоступны — можно принимать звонок и смотреть/слушать собеседника.';
+    }
+
+    function attachLocalPreview() {
+      localVideo.srcObject = localStream;
+      if (localStream.getVideoTracks().length) {
+        localVideo.play().catch(() => {});
+      }
+      if (localStream.getAudioTracks().length) {
+        startMicMonitor(localStream);
+      } else {
+        stopMicMonitor();
+      }
+      updateMediaInfo();
+    }
+
+    async function ensureLocalMedia() {
+      if (localStream) return localStream;
+      if (!window.isSecureContext) {
+        setStatus(
+          'На iPhone медиа работают только по HTTPS (или localhost). ' +
+          'Запустите сервер с -tls и откройте https://IP-адрес:8443',
+          true
+        );
+        return null;
+      }
+      localStream = await acquireLocalMedia();
+      mediaReady = true;
+      attachLocalPreview();
+      fetchMyIp();
+      announcePeerInfo();
+      callBtn.disabled = false;
+      muteMicBtn.disabled = !localStream.getAudioTracks().length;
+      muteCamBtn.disabled = !localStream.getVideoTracks().length;
+      startStatsMonitor();
+      return localStream;
+    }
+
     async function startCamera() {
       if (!window.isSecureContext) {
         setStatus(
-          'На iPhone камера работает только по HTTPS (или localhost). ' +
+          'На iPhone медиа работают только по HTTPS (или localhost). ' +
           'Запустите сервер с -tls и откройте https://IP-адрес:8443',
           true
         );
         return;
       }
-      if (!navigator.mediaDevices?.getUserMedia) {
-        setStatus('Браузер не поддерживает доступ к камере.', true);
-        return;
-      }
       startBtn.disabled = true;
       try {
-        localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
-        localVideo.srcObject = localStream;
-        await localVideo.play();
-        startMicMonitor(localStream);
-        updateMediaInfo();
-        fetchMyIp();
-        announcePeerInfo();
-        callBtn.disabled = false;
-        muteMicBtn.disabled = false;
-        startStatsMonitor();
-        if (!localStream.getAudioTracks().length) {
-          setStatus('Камера есть, но микрофон не получен — проверьте разрешения браузера.', true);
-        } else {
-          setStatus('Камера и микрофон включены. Проверьте уровень сигнала микрофона. На втором устройстве включите камеру.');
-        }
+        await ensureLocalMedia();
+        const hasVideo = localStream.getVideoTracks().length > 0;
+        const hasAudio = localStream.getAudioTracks().length > 0;
+        const isError = !hasVideo && !hasAudio;
+        setStatus(describeMediaState(), isError);
       } catch (err) {
         startBtn.disabled = false;
-        setStatus('Не удалось включить камеру: ' + (err.message || err), true);
+        mediaReady = false;
+        setStatus('Не удалось подключить устройства: ' + (err.message || err), true);
       }
     }
 
@@ -564,27 +623,57 @@
       updateMediaInfo();
     }
 
+    function toggleCam() {
+      const track = localStream?.getVideoTracks()[0];
+      if (!track) return;
+      camMuted = !camMuted;
+      track.enabled = !camMuted;
+      muteCamBtn.textContent = camMuted ? 'Включить камеру' : 'Выключить камеру';
+      updateMediaInfo();
+    }
+
+    function addLocalMediaToPeerConnection(pcConn) {
+      const hasVideo = localStream.getVideoTracks().length > 0;
+      const hasAudio = localStream.getAudioTracks().length > 0;
+      localStream.getTracks().forEach((t) => pcConn.addTrack(t, localStream));
+      if (!hasVideo) {
+        pcConn.addTransceiver('video', { direction: 'recvonly' });
+      }
+      if (!hasAudio) {
+        pcConn.addTransceiver('audio', { direction: 'recvonly' });
+      }
+    }
+
     function createPeerConnection() {
       if (pc) return;
       if (!localStream) {
-        setStatus('Сначала включите камеру.', true);
+        setStatus('Сначала нажмите «Подключить устройства».', true);
         return;
       }
       pc = new RTCPeerConnection(pcConfig);
-      localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+      addLocalMediaToPeerConnection(pc);
       applyMaxVideoEncoding(pc);
       pc.ontrack = async (e) => {
         remoteVideo.srcObject = e.streams[0];
+        const hasVideo = e.streams[0].getVideoTracks().length > 0;
         const hasAudio = e.streams[0].getAudioTracks().length > 0;
         const played = await tryPlayRemoteAudio();
-        if (hasAudio) {
+        if (hasVideo && hasAudio) {
           setStatus(
             played
               ? 'Связь установлена.'
-              : 'Видео есть. Нажмите «Включить звук собеседника», если не слышно.'
+              : 'Видео и звук подключены. Нажмите «Включить звук собеседника», если не слышно.'
+          );
+        } else if (hasVideo) {
+          setStatus('Видео от собеседника подключено, звук не передаётся.', !played);
+        } else if (hasAudio) {
+          setStatus(
+            played
+              ? 'Звук от собеседника подключён, видео не передаётся.'
+              : 'Только звук от собеседника. Нажмите «Включить звук собеседника», если не слышно.'
           );
         } else {
-          setStatus('Видео подключено, аудиодорожка от собеседника не пришла.', true);
+          setStatus('Соединение установлено, но медиа от собеседника не пришли.', true);
         }
       };
       pc.onicecandidate = (e) => {
@@ -612,8 +701,7 @@
     }
 
     async function createOffer() {
-      if (!localStream) {
-        setStatus('Сначала включите камеру.', true);
+      if (!(await ensureLocalMedia())) {
         return;
       }
       hangup(false);
@@ -648,12 +736,13 @@
         return;
       }
 
-      if (!localStream) {
-        setStatus('На этом устройстве ещё не включена камера — нажмите «Включить камеру».', true);
-        return;
-      }
-
       if (msg.type === 'offer') {
+        if (!(await ensureLocalMedia())) {
+          return;
+        }
+        if (!startBtn.disabled) {
+          startBtn.disabled = true;
+        }
         hangup(false);
         createPeerConnection();
         if (!pc) return;
@@ -668,7 +757,10 @@
         return;
       }
 
-      if (!pc) createPeerConnection();
+      if (!pc) {
+        if (!(await ensureLocalMedia())) return;
+        createPeerConnection();
+      }
       if (!pc) return;
 
       if (msg.type === 'answer') {
@@ -676,7 +768,11 @@
         await flushCandidates();
         await applyMaxVideoEncoding(pc);
         setInCall(true);
-        setStatus('Соединение установлено. Говорите в микрофон — полоска уровня должна реагировать.');
+        setStatus(
+          localStream?.getAudioTracks().length
+            ? 'Соединение установлено. Говорите в микрофон — полоска уровня должна реагировать.'
+            : 'Соединение установлено (ваш микрофон недоступен — вы не передаёте звук).'
+        );
       } else if (msg.type === 'candidate') {
         if (pc.remoteDescription) {
           await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
@@ -688,7 +784,7 @@
 
     if (!window.isSecureContext) {
       setStatus(
-        'Открыто по HTTP — на iPhone камера не заработает. ' +
+        'Открыто по HTTP — на iPhone медиа не заработают. ' +
         'Запустите: go run ./cmd -tls и откройте https://<IP>:8443 (не http и не порт 8080 для HTTPS)',
         true
       );
@@ -700,6 +796,7 @@
     callBtn.onclick = () => createOffer();
     hangupBtn.onclick = () => hangup(true);
     muteMicBtn.onclick = () => toggleMic();
+    muteCamBtn.onclick = () => toggleCam();
     unmuteRemoteBtn.onclick = () => tryPlayRemoteAudio();
   </script>
 </body>
