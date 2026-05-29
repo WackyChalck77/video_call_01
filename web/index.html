@@ -3,48 +3,418 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WebRTC Video Call</title>
+  <title>Тестовое ПО Video Call на WebRTC</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 12px; max-width: 900px; }
-    .videos { display: flex; flex-wrap: wrap; gap: 8px; }
-    video {
+    .videos { display: flex; flex-wrap: wrap; gap: 16px; }
+    .video-tile {
       width: min(100%, 420px);
+    }
+    .video-caption {
+      font-weight: 600;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+    .video-ip {
+      font-size: 13px;
+      color: #555;
+      margin-top: 4px;
+      font-family: ui-monospace, monospace;
+    }
+    .video-tile video {
+      width: 100%;
       aspect-ratio: 4/3;
       background: #111;
       border: 2px solid #333;
       object-fit: cover;
+      display: block;
     }
     #status { margin: 12px 0; padding: 10px; border-radius: 6px; background: #f4f4f4; }
     #status.error { background: #fde8e8; color: #8a1f1f; }
+    #mediaInfo { font-size: 14px; color: #444; margin-bottom: 8px; }
+    .mic-meter {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0 12px;
+      font-size: 14px;
+    }
+    .mic-meter span.bar {
+      display: inline-block;
+      width: 120px;
+      height: 8px;
+      background: #ddd;
+      border-radius: 4px;
+      overflow: hidden;
+      vertical-align: middle;
+    }
+    .mic-meter span.bar i {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: #2a9d4b;
+      transition: width 0.05s linear;
+    }
     button { margin: 4px 8px 4px 0; padding: 10px 16px; font-size: 16px; }
     button:disabled { opacity: 0.5; }
+    button.danger { background: #c62828; color: #fff; border: 1px solid #a31f1f; }
+    #statsPanel {
+      margin-top: 16px;
+      padding: 12px;
+      background: #f8f9fa;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 13px;
+    }
+    #statsPanel h2 { margin: 0 0 10px; font-size: 16px; }
+    #statsPanel table { width: 100%; border-collapse: collapse; }
+    #statsPanel th, #statsPanel td {
+      text-align: left;
+      padding: 6px 8px;
+      border-bottom: 1px solid #e5e5e5;
+      vertical-align: top;
+    }
+    #statsPanel th { width: 38%; color: #555; font-weight: 600; }
+    #statsPanel .section td { background: #eef2f5; font-weight: 600; color: #333; }
   </style>
 </head>
 <body>
-  <h1>WebRTC Video Call</h1>
+  <h1>ПО для тестирования Video Call WebRTC </h1>
   <p id="status">Нажмите «Включить камеру» на обоих устройствах, затем «Позвонить» на одном из них.</p>
+  <p id="mediaInfo"></p>
+  <div class="mic-meter" id="micMeter" hidden>
+    <span>Микрофон:</span>
+    <span class="bar"><i id="micLevel"></i></span>
+    <span id="micHint">уровень микрофона</span>
+  </div>
   <div class="videos">
-    <video id="local" autoplay muted playsinline></video>
-    <video id="remote" autoplay muted playsinline></video>
+    <div class="video-tile">
+      <div class="video-caption">Ваша камера</div>
+      <video id="local" autoplay muted playsinline></video>
+      <div class="video-ip" id="localIp">IP: —</div>
+    </div>
+    <div class="video-tile">
+      <div class="video-caption">Камера собеседника</div>
+      <video id="remote" autoplay playsinline></video>
+      <div class="video-ip" id="remoteIp">IP: —</div>
+    </div>
   </div>
   <div>
     <button id="startBtn">Включить камеру</button>
     <button id="callBtn" disabled>Позвонить</button>
+    <button id="hangupBtn" class="danger" disabled>Завершить звонок</button>
+    <button id="muteMicBtn" disabled>Выключить микрофон</button>
+    <button id="unmuteRemoteBtn" disabled hidden>Включить звук собеседника</button>
   </div>
+
+  <section id="statsPanel" hidden>
+    <h2>Параметры соединения</h2>
+    <table>
+      <tbody id="statsBody"></tbody>
+    </table>
+  </section>
 
   <script>
     const localVideo = document.getElementById('local');
     const remoteVideo = document.getElementById('remote');
     const statusEl = document.getElementById('status');
+    const mediaInfoEl = document.getElementById('mediaInfo');
+    const micMeterEl = document.getElementById('micMeter');
+    const micLevelEl = document.getElementById('micLevel');
     const startBtn = document.getElementById('startBtn');
     const callBtn = document.getElementById('callBtn');
-    let pc, localStream, ws;
+    const hangupBtn = document.getElementById('hangupBtn');
+    const muteMicBtn = document.getElementById('muteMicBtn');
+    const unmuteRemoteBtn = document.getElementById('unmuteRemoteBtn');
+    const statsPanel = document.getElementById('statsPanel');
+    const statsBody = document.getElementById('statsBody');
+    const localIpEl = document.getElementById('localIp');
+    const remoteIpEl = document.getElementById('remoteIp');
+
+    let pc, localStream, ws, inCall = false, micMuted = false;
+    let mySignalingIp = '';
+    let peerSignalingIp = '';
+    let peerWebRTCIp = '';
     const pendingCandidates = [];
-    const pcConfig = { iceServers: [] };
+    const pcConfig = {
+      iceServers: [],
+      bundlePolicy: 'max-bundle',
+    };
+    const mediaConstraints = {
+      video: {
+        width: { ideal: 1920, max: 3840 },
+        height: { ideal: 1080, max: 2160 },
+        frameRate: { ideal: 30, max: 60 },
+      },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    };
+    const MAX_VIDEO_BITRATE = 10_000_000;
+    let audioCtx, analyser, levelRAF;
+    let statsTimer = null;
+    const byteSamples = {};
 
     function setStatus(text, isError) {
       statusEl.textContent = text;
       statusEl.classList.toggle('error', !!isError);
+    }
+
+    function setLocalIpText() {
+      localIpEl.textContent = mySignalingIp ? 'IP: ' + mySignalingIp : 'IP: —';
+    }
+
+    function setRemoteIpText() {
+      if (!peerSignalingIp && !peerWebRTCIp) {
+        remoteIpEl.textContent = 'IP: —';
+        return;
+      }
+      const parts = [];
+      if (peerSignalingIp) parts.push(peerSignalingIp);
+      if (peerWebRTCIp && peerWebRTCIp !== peerSignalingIp) {
+        parts.push('WebRTC ' + peerWebRTCIp);
+      }
+      remoteIpEl.textContent = 'IP: ' + parts.join(' · ');
+    }
+
+    function announcePeerInfo() {
+      if (mySignalingIp) sendSignal({ type: 'peer-info', ip: mySignalingIp });
+    }
+
+    async function fetchMyIp() {
+      try {
+        const res = await fetch('/api/ip');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.ip) {
+          mySignalingIp = data.ip;
+          setLocalIpText();
+          announcePeerInfo();
+        }
+      } catch (_) { /* сервер недоступен */ }
+    }
+
+    async function applyMaxVideoEncoding(pcConn) {
+      if (!pcConn) return;
+      for (const sender of pcConn.getSenders()) {
+        if (sender.track?.kind !== 'video') continue;
+        try {
+          const params = sender.getParameters();
+          if (!params.encodings?.length) params.encodings = [{}];
+          const enc = params.encodings[0];
+          enc.active = true;
+          enc.maxBitrate = MAX_VIDEO_BITRATE;
+          enc.maxFramerate = 60;
+          enc.scaleResolutionDownBy = 1;
+          params.degradationPreference = 'maintain-resolution';
+          await sender.setParameters(params);
+        } catch (err) {
+          console.warn('Не удалось задать параметры видео:', err);
+        }
+      }
+    }
+
+    function formatBitrate(bps) {
+      if (!bps || bps < 0 || !Number.isFinite(bps)) return '—';
+      if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' Мбит/с';
+      if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' кбит/с';
+      return Math.round(bps) + ' бит/с';
+    }
+
+    function formatRes(w, h) {
+      if (!w || !h) return '—';
+      return w + '×' + h;
+    }
+
+    function formatFps(fps) {
+      if (fps == null || !Number.isFinite(fps)) return '—';
+      return fps.toFixed(1) + ' к/с';
+    }
+
+    function sampleBitrate(id, bytes, timestamp) {
+      const prev = byteSamples[id];
+      byteSamples[id] = { bytes, timestamp };
+      if (!prev || timestamp <= prev.timestamp) return 0;
+      const dt = (timestamp - prev.timestamp) / 1000;
+      const db = bytes - prev.bytes;
+      if (dt <= 0 || db < 0) return 0;
+      return (8 * db) / dt;
+    }
+
+    function renderStats(rows) {
+      statsBody.innerHTML = rows.map((row) => {
+        if (row.section) {
+          return '<tr class="section"><td colspan="2">' + row.section + '</td></tr>';
+        }
+        return '<tr><th>' + row.label + '</th><td>' + row.value + '</td></tr>';
+      }).join('');
+    }
+
+    function localVideoSettings() {
+      const track = localStream?.getVideoTracks()[0];
+      if (!track) return {};
+      const s = track.getSettings?.() || {};
+      return {
+        width: s.width || localVideo.videoWidth,
+        height: s.height || localVideo.videoHeight,
+        fps: s.frameRate,
+      };
+    }
+
+    function remoteDisplaySize() {
+      return {
+        width: remoteVideo.videoWidth,
+        height: remoteVideo.videoHeight,
+      };
+    }
+
+    async function refreshStats() {
+      const rows = [];
+      const local = localVideoSettings();
+
+      rows.push({ section: 'Соединение WebRTC' });
+      if (pc) {
+        rows.push({ label: 'Состояние', value: pc.connectionState || '—' });
+        // rows.push({ label: 'ICE', value: pc.iceConnectionState || '—' });
+      } else {
+        rows.push({ label: 'Состояние', value: inCall ? '—' : 'нет звонка' });
+      }
+
+      let pair = null;
+      let outV = null;
+      let inV = null;
+      let outA = null;
+      let inA = null;
+
+      if (pc) {
+        const reports = await pc.getStats();
+        reports.forEach((r) => {
+          if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || !pair)) {
+            if (r.nominated) pair = r;
+            else if (!pair?.nominated) pair = r;
+          }
+          if (r.type === 'outbound-rtp' && r.kind === 'video' && !r.isRemote) outV = r;
+          if (r.type === 'inbound-rtp' && r.kind === 'video') inV = r;
+          if (r.type === 'outbound-rtp' && r.kind === 'audio' && !r.isRemote) outA = r;
+          if (r.type === 'inbound-rtp' && r.kind === 'audio') inA = r;
+        });
+        if (pair?.currentRoundTripTime != null) {
+          rows.push({
+            label: 'Задержка (RTT, Round-Trip Time) — круговая задержка',
+            value: Math.round(pair.currentRoundTripTime * 1000) + ' мс',
+          });
+        }
+        if (pair?.availableOutgoingBitrate != null) {
+          rows.push({
+            label: 'Доступная исходящая полоса',
+            value: formatBitrate(pair.availableOutgoingBitrate),
+          });
+        }
+        let remoteCandIP = '';
+        reports.forEach((r) => {
+          if (r.type !== 'remote-candidate') return;
+          const addr = r.ip || r.address;
+          if (addr && addr !== '0.0.0.0') remoteCandIP = addr;
+        });
+        if (remoteCandIP) {
+          peerWebRTCIp = remoteCandIP;
+          setRemoteIpText();
+        }
+      }
+
+      // rows.push({ section: 'Ваша камера (локально)' });
+      // rows.push({ label: 'Разрешение', value: formatRes(local.width, local.height) });
+      // rows.push({ label: 'Частота кадров', value: formatFps(local.fps) });
+
+      rows.push({ section: 'Исходящее видео (к собеседнику)' });
+      if (outV) {
+        const vw = outV.frameWidth || local.width;
+        const vh = outV.frameHeight || local.height;
+        rows.push({ label: 'Разрешение', value: formatRes(vw, vh) });
+        rows.push({ label: 'Частота кадров', value: formatFps(outV.framesPerSecond) });
+        rows.push({
+          label: 'Скорость (битрейт)',
+          value: formatBitrate(sampleBitrate('outV', outV.bytesSent, outV.timestamp)),
+        });
+      } else {
+        rows.push({ label: 'Разрешение', value: '—' });
+        rows.push({ label: 'Частота кадров', value: '—' });
+        rows.push({ label: 'Скорость (битрейт)', value: '—' });
+      }
+      if (outA) {
+        rows.push({
+          label: 'Аудио (битрейт)',
+          value: formatBitrate(sampleBitrate('outA', outA.bytesSent, outA.timestamp)),
+        });
+      }
+
+      const remote = remoteDisplaySize();
+      rows.push({ section: 'Входящее видео (от собеседника)' });
+      if (inV) {
+        rows.push({
+          label: 'Разрешение (кодек)',
+          value: formatRes(inV.frameWidth, inV.frameHeight),
+        });
+        // rows.push({
+        //   label: 'Разрешение (на экране)',
+        //   value: formatRes(remote.width, remote.height),
+        // });
+        rows.push({ label: 'Частота кадров', value: formatFps(inV.framesPerSecond) });
+        rows.push({
+          label: 'Скорость (битрейт)',
+          value: formatBitrate(sampleBitrate('inV', inV.bytesReceived, inV.timestamp)),
+        });
+        if (inV.jitter != null) {
+          rows.push({ label: 'Джиттер', value: (inV.jitter * 1000).toFixed(1) + ' мс' });
+        }
+        if (inV.packetsLost != null) {
+          rows.push({ label: 'Потеряно пакетов', value: String(inV.packetsLost) });
+        }
+      } else {
+        rows.push({ label: 'Разрешение', value: formatRes(remote.width, remote.height) || '—' });
+        rows.push({ label: 'Частота кадров', value: '—' });
+        rows.push({ label: 'Скорость (битрейт)', value: '—' });
+      }
+      if (inA) {
+        rows.push({
+          label: 'Аудио (битрейт)',
+          value: formatBitrate(sampleBitrate('inA', inA.bytesReceived, inA.timestamp)),
+        });
+      }
+
+      renderStats(rows);
+    }
+
+    function startStatsMonitor() {
+      stopStatsMonitor();
+      statsPanel.hidden = false;
+      refreshStats();
+      statsTimer = setInterval(refreshStats, 1000);
+    }
+
+    function stopStatsMonitor() {
+      if (statsTimer) {
+        clearInterval(statsTimer);
+        statsTimer = null;
+      }
+      Object.keys(byteSamples).forEach((k) => delete byteSamples[k]);
+      statsPanel.hidden = true;
+      statsBody.innerHTML = '';
+    }
+
+    function updateMediaInfo() {
+      if (!localStream) {
+        mediaInfoEl.textContent = '';
+        return;
+      }
+      const v = localStream.getVideoTracks()[0];
+      const a = localStream.getAudioTracks()[0];
+      const parts = [];
+      parts.push(v ? 'камера: ' + (v.label || 'вкл') : 'камера: нет');
+      parts.push(a ? 'микрофон: ' + (a.label || 'вкл') + (a.enabled ? '' : ' (выкл)') : 'микрофон: нет');
+      mediaInfoEl.textContent = parts.join(' · ');
     }
 
     function wsURL() {
@@ -55,10 +425,98 @@
     function connectSignaling() {
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
       ws = new WebSocket(wsURL());
-      ws.onopen = () => setStatus('Сигналинг подключён. Включите камеру на обоих устройствах.');
+      ws.onopen = () => {
+        setStatus('Включите камеру на обоих устройствах.');
+        fetchMyIp();
+      };
       ws.onclose = () => setStatus('Соединение с сервером разорвано. Обновите страницу.', true);
       ws.onerror = () => setStatus('Ошибка WebSocket. Проверьте, что сервер запущен.', true);
       ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+    }
+
+    function stopMicMonitor() {
+      if (levelRAF) cancelAnimationFrame(levelRAF);
+      levelRAF = null;
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+        audioCtx = null;
+      }
+      analyser = null;
+      micMeterEl.hidden = true;
+      micLevelEl.style.width = '0%';
+    }
+
+    function startMicMonitor(stream) {
+      stopMicMonitor();
+      const track = stream.getAudioTracks()[0];
+      if (!track) return;
+      micMeterEl.hidden = false;
+      audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(new MediaStream([track]));
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      const tick = () => {
+        if (!analyser) return;
+        analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length;
+        micLevelEl.style.width = Math.min(100, avg * 1.4) + '%';
+        levelRAF = requestAnimationFrame(tick);
+      };
+      tick();
+    }
+
+    async function tryPlayRemoteAudio() {
+      remoteVideo.muted = false;
+      try {
+        await remoteVideo.play();
+        unmuteRemoteBtn.hidden = true;
+        unmuteRemoteBtn.disabled = true;
+        return true;
+      } catch (_) {
+        unmuteRemoteBtn.hidden = false;
+        unmuteRemoteBtn.disabled = false;
+        return false;
+      }
+    }
+
+    function setInCall(active) {
+      inCall = active;
+      callBtn.disabled = active || !localStream;
+      hangupBtn.disabled = !active;
+      muteMicBtn.disabled = !localStream;
+    }
+
+    function sendSignal(payload) {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+      }
+    }
+
+    function hangup(notifyPeer) {
+      stopStatsMonitor();
+      if (pc) {
+        pc.ontrack = null;
+        pc.onicecandidate = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+        pc = null;
+      }
+      pendingCandidates.length = 0;
+      remoteVideo.srcObject = null;
+      remoteVideo.muted = false;
+      peerSignalingIp = '';
+      peerWebRTCIp = '';
+      setRemoteIpText();
+      setInCall(false);
+      unmuteRemoteBtn.hidden = true;
+      unmuteRemoteBtn.disabled = true;
+      if (notifyPeer) sendSignal({ type: 'hangup' });
+      setStatus('Звонок завершён. Можно снова нажать «Позвонить».');
     }
 
     async function startCamera() {
@@ -76,15 +534,34 @@
       }
       startBtn.disabled = true;
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
         localVideo.srcObject = localStream;
         await localVideo.play();
+        startMicMonitor(localStream);
+        updateMediaInfo();
+        fetchMyIp();
+        announcePeerInfo();
         callBtn.disabled = false;
-        setStatus('Камера включена. На втором устройстве тоже нажмите «Включить камеру», затем «Позвонить» здесь.');
+        muteMicBtn.disabled = false;
+        startStatsMonitor();
+        if (!localStream.getAudioTracks().length) {
+          setStatus('Камера есть, но микрофон не получен — проверьте разрешения браузера.', true);
+        } else {
+          setStatus('Камера и микрофон включены. Проверьте уровень сигнала микрофона. На втором устройстве включите камеру.');
+        }
       } catch (err) {
         startBtn.disabled = false;
         setStatus('Не удалось включить камеру: ' + (err.message || err), true);
       }
+    }
+
+    function toggleMic() {
+      const track = localStream?.getAudioTracks()[0];
+      if (!track) return;
+      micMuted = !micMuted;
+      track.enabled = !micMuted;
+      muteMicBtn.textContent = micMuted ? 'Включить микрофон' : 'Выключить микрофон';
+      updateMediaInfo();
     }
 
     function createPeerConnection() {
@@ -95,21 +572,34 @@
       }
       pc = new RTCPeerConnection(pcConfig);
       localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+      applyMaxVideoEncoding(pc);
       pc.ontrack = async (e) => {
         remoteVideo.srcObject = e.streams[0];
-        try {
-          await remoteVideo.play();
-        } catch (_) { /* autoplay blocked — tap page if needed */ }
-        setStatus('Удалённое видео подключено.');
-      };
-      pc.onicecandidate = (e) => {
-        if (e.candidate && ws?.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+        const hasAudio = e.streams[0].getAudioTracks().length > 0;
+        const played = await tryPlayRemoteAudio();
+        if (hasAudio) {
+          setStatus(
+            played
+              ? 'Связь установлена.'
+              : 'Видео есть. Нажмите «Включить звук собеседника», если не слышно.'
+          );
+        } else {
+          setStatus('Видео подключено, аудиодорожка от собеседника не пришла.', true);
         }
       };
+      pc.onicecandidate = (e) => {
+        if (e.candidate) sendSignal({ type: 'candidate', candidate: e.candidate });
+      };
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed') {
-          setStatus('WebRTC не соединился. Оба устройства в одной сети? Попробуйте снова.', true);
+        if (!pc) return;
+        if (pc.connectionState === 'connected') {
+          setInCall(true);
+          startStatsMonitor();
+          applyMaxVideoEncoding(pc);
+        }
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          setStatus('Связь прервана.', true);
+          hangup(false);
         }
       };
     }
@@ -126,35 +616,67 @@
         setStatus('Сначала включите камеру.', true);
         return;
       }
+      hangup(false);
       createPeerConnection();
       if (!pc) return;
-      callBtn.disabled = true;
+      setInCall(true);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
+      await applyMaxVideoEncoding(pc);
+      sendSignal({ type: 'offer', sdp: offer });
       setStatus('Звонок… ждём ответ второго устройства.');
     }
 
     async function handleMessage(msg) {
+      if (msg.type === 'hello' && msg.ip) {
+        mySignalingIp = msg.ip;
+        setLocalIpText();
+        announcePeerInfo();
+        return;
+      }
+      if (msg.type === 'request-peer-info') {
+        announcePeerInfo();
+        return;
+      }
+      if (msg.type === 'peer-info' && msg.ip && msg.ip !== mySignalingIp) {
+        peerSignalingIp = msg.ip;
+        setRemoteIpText();
+        return;
+      }
+      if (msg.type === 'hangup') {
+        if (inCall || pc) hangup(false);
+        return;
+      }
+
       if (!localStream) {
         setStatus('На этом устройстве ещё не включена камера — нажмите «Включить камеру».', true);
         return;
       }
-      if (!pc) createPeerConnection();
-      if (!pc) return;
 
       if (msg.type === 'offer') {
+        hangup(false);
+        createPeerConnection();
+        if (!pc) return;
+        setInCall(true);
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
         await flushCandidates();
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
-        setStatus('Входящий звонок принят.');
-      } else if (msg.type === 'answer') {
+        await applyMaxVideoEncoding(pc);
+        sendSignal({ type: 'answer', sdp: answer });
+        setStatus('Входящий звонок принят. Если не слышно — нажмите «Включить звук собеседника».');
+        return;
+      }
+
+      if (!pc) createPeerConnection();
+      if (!pc) return;
+
+      if (msg.type === 'answer') {
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
         await flushCandidates();
-        callBtn.disabled = false;
-        setStatus('Соединение установлено.');
+        await applyMaxVideoEncoding(pc);
+        setInCall(true);
+        setStatus('Соединение установлено. Говорите в микрофон — полоска уровня должна реагировать.');
       } else if (msg.type === 'candidate') {
         if (pc.remoteDescription) {
           await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
@@ -172,9 +694,13 @@
       );
     }
 
+    fetchMyIp();
     connectSignaling();
     startBtn.onclick = () => startCamera();
     callBtn.onclick = () => createOffer();
+    hangupBtn.onclick = () => hangup(true);
+    muteMicBtn.onclick = () => toggleMic();
+    unmuteRemoteBtn.onclick = () => tryPlayRemoteAudio();
   </script>
 </body>
 </html>

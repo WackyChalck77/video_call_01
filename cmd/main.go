@@ -1,6 +1,8 @@
 package main
 
+// запускать так go run ./cmd -tls
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -21,13 +23,39 @@ var upgrader = websocket.Upgrader{
 var clients = make(map[*websocket.Conn]bool)
 var mu sync.Mutex
 
+func broadcastPeerInfoRequest() {
+	req, err := json.Marshal(map[string]string{"type": "request-peer-info"})
+	if err != nil {
+		return
+	}
+	for c := range clients {
+		_ = c.WriteMessage(websocket.TextMessage, req)
+	}
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return strings.TrimSpace(strings.Split(xff, ",")[0])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
+	ip := clientIP(r)
+	hello, _ := json.Marshal(map[string]string{"type": "hello", "ip": ip})
+	_ = conn.WriteMessage(websocket.TextMessage, hello)
+
 	mu.Lock()
 	clients[conn] = true
+	broadcastPeerInfoRequest()
 	mu.Unlock()
 
 	defer func() {
@@ -100,9 +128,15 @@ func httpsRedirectURL(r *http.Request, httpsAddr string) string {
 	return fmt.Sprintf("https://%s:%s%s", hostname, httpsPort, path)
 }
 
+func ipHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"ip": clientIP(r)})
+}
+
 func newMux(webRoot string) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler)
+	mux.HandleFunc("/api/ip", ipHandler)
 	mux.Handle("/", http.FileServer(http.Dir(webRoot)))
 	return mux
 }
